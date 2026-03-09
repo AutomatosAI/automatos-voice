@@ -67,12 +67,13 @@ for noisy in ("faster_whisper", "ctranslate2", "httpx", "httpcore"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
-# Global model holders (set during lifespan)
+# Global model holders (lazy-loaded on first request)
 # ---------------------------------------------------------------------------
 
 _whisper_model: Any = None
 _kokoro_pipeline: Any = None
 _chatterbox_model: Any = None
+_loading_locks: dict[str, asyncio.Lock] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -178,56 +179,105 @@ def _load_chatterbox() -> Any:
 # ---------------------------------------------------------------------------
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-    """Load models in background on startup, clean up on shutdown."""
-    global _whisper_model, _kokoro_pipeline, _chatterbox_model
+async def _get_lock(name: str) -> asyncio.Lock:
+    """Get or create a named lock for lazy model loading."""
+    if name not in _loading_locks:
+        _loading_locks[name] = asyncio.Lock()
+    return _loading_locks[name]
 
-    loop = asyncio.get_running_loop()
-    engine = config.tts.engine
 
-    # Load STT
-    set_model_status("stt", "loading")
-    try:
-        _whisper_model = await loop.run_in_executor(None, _load_whisper)
-        set_model_status("stt", "loaded")
-        model_loaded.labels(model_type="stt", model_name=config.stt.model).set(1)
-    except Exception:
-        logger.exception("Failed to load Whisper model")
-        set_model_status("stt", "error")
-        model_loaded.labels(model_type="stt", model_name=config.stt.model).set(0)
+async def _ensure_whisper() -> Any:
+    """Lazy-load Whisper model on first STT request."""
+    global _whisper_model
+    if _whisper_model is not None:
+        return _whisper_model
 
-    # Load Kokoro TTS (if configured)
-    if engine in ("kokoro", "both"):
+    lock = await _get_lock("whisper")
+    async with lock:
+        if _whisper_model is not None:
+            return _whisper_model
+        set_model_status("stt", "loading")
+        try:
+            loop = asyncio.get_running_loop()
+            _whisper_model = await loop.run_in_executor(None, _load_whisper)
+            set_model_status("stt", "loaded")
+            model_loaded.labels(model_type="stt", model_name=config.stt.model).set(1)
+            return _whisper_model
+        except Exception:
+            logger.exception("Failed to load Whisper model")
+            set_model_status("stt", "error")
+            model_loaded.labels(model_type="stt", model_name=config.stt.model).set(0)
+            raise
+
+
+async def _ensure_kokoro() -> Any:
+    """Lazy-load Kokoro TTS on first request."""
+    global _kokoro_pipeline
+    if _kokoro_pipeline is not None:
+        return _kokoro_pipeline
+
+    lock = await _get_lock("kokoro")
+    async with lock:
+        if _kokoro_pipeline is not None:
+            return _kokoro_pipeline
         set_model_status("tts", "loading")
         try:
+            loop = asyncio.get_running_loop()
             _kokoro_pipeline = await loop.run_in_executor(None, _load_kokoro)
             set_model_status("tts", "loaded")
             model_loaded.labels(model_type="tts", model_name="kokoro").set(1)
+            return _kokoro_pipeline
         except Exception:
             logger.exception("Failed to load Kokoro TTS pipeline")
             set_model_status("tts", "error")
             model_loaded.labels(model_type="tts", model_name="kokoro").set(0)
+            raise
 
-    # Load Chatterbox TTS (if configured)
-    if engine in ("chatterbox", "both"):
+
+async def _ensure_chatterbox() -> Any:
+    """Lazy-load Chatterbox TTS on first voice-clone request."""
+    global _chatterbox_model
+    if _chatterbox_model is not None:
+        return _chatterbox_model
+
+    lock = await _get_lock("chatterbox")
+    async with lock:
+        if _chatterbox_model is not None:
+            return _chatterbox_model
         set_model_status("tts_chatterbox", "loading")
         try:
+            loop = asyncio.get_running_loop()
             _chatterbox_model = await loop.run_in_executor(None, _load_chatterbox)
             set_model_status("tts_chatterbox", "loaded")
             model_loaded.labels(model_type="tts", model_name="chatterbox").set(1)
+            return _chatterbox_model
         except Exception:
             logger.exception("Failed to load Chatterbox TTS model")
             set_model_status("tts_chatterbox", "error")
             model_loaded.labels(model_type="tts", model_name="chatterbox").set(0)
+            raise
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    """Lightweight startup — models are lazy-loaded on first request."""
+    logger.info(
+        "Voice service starting (lazy model loading)",
+        extra={"engine": config.tts.engine, "stt_model": config.stt.model},
+    )
     yield
-
     # Cleanup
-    _whisper_model = None
-    _kokoro_pipeline = None
-    _chatterbox_model = None
-    logger.info("Voice service shut down")
+    _whisper_model_ref = _whisper_model
+    _kokoro_ref = _kokoro_pipeline
+    _chatterbox_ref = _chatterbox_model
+    logger.info(
+        "Voice service shut down",
+        extra={
+            "whisper_was_loaded": _whisper_model_ref is not None,
+            "kokoro_was_loaded": _kokoro_ref is not None,
+            "chatterbox_was_loaded": _chatterbox_ref is not None,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +373,10 @@ async def transcribe(
     model: str = Form(default="whisper-1", description="Model name (ignored, uses configured model)"),
 ) -> TranscriptionResponse:
     """Transcribe an audio file to text (OpenAI-compatible)."""
-    if _whisper_model is None:
-        raise HTTPException(status_code=503, detail="STT model is not loaded")
+    try:
+        await _ensure_whisper()
+    except Exception:
+        raise HTTPException(status_code=503, detail="STT model failed to load")
 
     inference_queue_depth.labels(model_type="stt").inc()
     start_time = time.monotonic()
@@ -461,10 +513,13 @@ async def synthesize(request: TTSRequest) -> Response:
     if engine == "both":
         engine = "kokoro"  # default to kokoro when engine="both"
 
-    if engine == "chatterbox" and _chatterbox_model is None:
-        raise HTTPException(status_code=503, detail="Chatterbox TTS model is not loaded")
-    if engine == "kokoro" and _kokoro_pipeline is None:
-        raise HTTPException(status_code=503, detail="Kokoro TTS model is not loaded")
+    try:
+        if engine == "chatterbox":
+            await _ensure_chatterbox()
+        else:
+            await _ensure_kokoro()
+    except Exception:
+        raise HTTPException(status_code=503, detail=f"{engine} TTS model failed to load")
 
     inference_queue_depth.labels(model_type="tts").inc()
     start_time = time.monotonic()
@@ -517,7 +572,12 @@ async def synthesize(request: TTSRequest) -> Response:
             audio_array, sample_rate = await loop.run_in_executor(None, _synthesize_kokoro)
 
         # Encode to requested format
-        if request.response_format == "wav":
+        if request.response_format == "pcm":
+            # Raw 16-bit signed PCM for streaming pipelines
+            pcm_int16 = (np.clip(audio_array, -1.0, 1.0) * 32767).astype(np.int16)
+            audio_bytes = pcm_int16.tobytes()
+            media_type = "audio/pcm"
+        elif request.response_format == "wav":
             audio_bytes = _encode_wav(audio_array, sample_rate)
             media_type = "audio/wav"
         else:
@@ -590,10 +650,12 @@ async def clone_preview(
     Upload a reference audio file and receive synthesized speech
     that mimics the reference voice.
     """
-    if _chatterbox_model is None:
+    try:
+        await _ensure_chatterbox()
+    except Exception:
         raise HTTPException(
             status_code=503,
-            detail="Chatterbox TTS model is not loaded. Set TTS_ENGINE=chatterbox or TTS_ENGINE=both.",
+            detail="Chatterbox TTS model failed to load. Set TTS_ENGINE=chatterbox or TTS_ENGINE=both.",
         )
 
     start_time = time.monotonic()
