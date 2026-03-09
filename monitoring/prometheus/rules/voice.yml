@@ -1,0 +1,67 @@
+groups:
+  - name: voice_service_alerts
+    rules:
+      - alert: VoiceServiceDown
+        expr: up{job="voice-service"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: voice
+        annotations:
+          summary: "Voice service is down"
+          description: "Voice service has been unreachable for more than 1 minute."
+
+      - alert: VoiceSTTSlow
+        expr: histogram_quantile(0.95, rate(voice_stt_duration_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: voice
+        annotations:
+          summary: "STT p95 latency exceeds 10s"
+          description: "95th percentile STT transcription latency is {{ $value }}s (threshold: 10s)."
+
+      - alert: VoiceTTSSlow
+        expr: histogram_quantile(0.95, rate(voice_tts_duration_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+          service: voice
+        annotations:
+          summary: "TTS p95 latency exceeds 5s"
+          description: "95th percentile TTS synthesis latency is {{ $value }}s (threshold: 5s)."
+
+      - alert: VoiceHighErrorRate
+        expr: >
+          (
+            sum(rate(voice_stt_errors_total[5m])) + sum(rate(voice_tts_errors_total[5m]))
+          ) / (
+            sum(rate(voice_stt_requests_total[5m])) + sum(rate(voice_tts_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: voice
+        annotations:
+          summary: "Voice service error rate exceeds 5%"
+          description: "Combined STT+TTS error rate is {{ $value | humanizePercentage }} over the last 5 minutes."
+
+      - alert: VoiceQueueBacklog
+        expr: voice_inference_queue_depth > 10
+        for: 2m
+        labels:
+          severity: warning
+          service: voice
+        annotations:
+          summary: "Voice inference queue backlog"
+          description: "{{ $labels.model_type }} inference queue depth is {{ $value }} (threshold: 10)."
+
+      - alert: VoiceModelNotLoaded
+        expr: voice_model_loaded == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: voice
+        annotations:
+          summary: "Voice model not loaded"
+          description: "{{ $labels.model_type }} model '{{ $labels.model_name }}' has not loaded after 5 minutes."

@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  voice-service:
+    build:
+      context: .
+      dockerfile: services/voice-service/Dockerfile
+    ports:
+      - "${PORT:-8300}:8300"
+    env_file:
+      - .env
+    volumes:
+      - model-cache:/app/models
+      - ./services/voice-service:/app/src
+    restart: on-failure:3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8300/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  model-cache:
+    driver: local
