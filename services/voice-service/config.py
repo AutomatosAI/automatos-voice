@@ -29,6 +29,15 @@ class TTSConfig:
     default_voice: str = os.getenv("TTS_DEFAULT_VOICE", "af_heart")
     sample_rate: int = int(os.getenv("TTS_SAMPLE_RATE", "24000"))
 
+    # Engine selection: which TTS backends to load on startup
+    # Options: "kokoro", "chatterbox", "both"
+    engine: str = os.getenv("TTS_ENGINE", "kokoro")
+
+    # Chatterbox-specific settings
+    chatterbox_device: str = os.getenv("TTS_CHATTERBOX_DEVICE", "auto")
+    chatterbox_exaggeration: float = float(os.getenv("TTS_CHATTERBOX_EXAGGERATION", "0.25"))
+    chatterbox_sample_rate: int = 24000  # Fixed by Chatterbox model
+
 
 @dataclass(frozen=True)
 class ServiceConfig:

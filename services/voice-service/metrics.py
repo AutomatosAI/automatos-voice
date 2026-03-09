@@ -59,7 +59,7 @@ stt_errors_total = Counter(
 tts_requests_total = Counter(
     "voice_tts_requests_total",
     "Total number of TTS synthesis requests",
-    labelnames=["voice", "status"],
+    labelnames=["engine", "voice", "status"],
     registry=registry,
 )
 
@@ -86,7 +86,14 @@ tts_audio_duration_seconds = Histogram(
 tts_errors_total = Counter(
     "voice_tts_errors_total",
     "Total number of TTS errors",
-    labelnames=["error_type"],
+    labelnames=["engine", "error_type"],
+    registry=registry,
+)
+
+tts_voice_clone_requests_total = Counter(
+    "voice_tts_voice_clone_requests_total",
+    "Total number of voice clone preview requests",
+    labelnames=["status"],
     registry=registry,
 )
 

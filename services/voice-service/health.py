@@ -17,6 +17,7 @@ router = APIRouter()
 _model_status: dict[str, str] = {
     "stt": "not_loaded",
     "tts": "not_loaded",
+    "tts_chatterbox": "not_loaded",
 }
 
 
@@ -58,5 +59,6 @@ async def health_check() -> dict[str, Any]:
         "models": {
             "stt": _model_status["stt"],
             "tts": _model_status["tts"],
+            "tts_chatterbox": _model_status["tts_chatterbox"],
         },
     }

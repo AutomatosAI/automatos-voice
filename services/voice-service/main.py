@@ -2,7 +2,8 @@
 
 Provides:
   POST /v1/audio/transcriptions  (STT via faster-whisper)
-  POST /v1/audio/speech           (TTS via Kokoro)
+  POST /v1/audio/speech           (TTS via Kokoro or Chatterbox)
+  POST /v1/audio/clone-preview    (Voice cloning preview via Chatterbox)
   GET  /health
   GET  /metrics
 """
@@ -10,9 +11,9 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import logging
-import struct
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -22,7 +23,7 @@ from typing import Any, AsyncGenerator
 import numpy as np
 import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from pythonjsonlogger import jsonlogger
@@ -42,6 +43,7 @@ from .metrics import (
     tts_duration_seconds,
     tts_errors_total,
     tts_requests_total,
+    tts_voice_clone_requests_total,
 )
 
 # ---------------------------------------------------------------------------
@@ -70,6 +72,7 @@ for noisy in ("faster_whisper", "ctranslate2", "httpx", "httpcore"):
 
 _whisper_model: Any = None
 _kokoro_pipeline: Any = None
+_chatterbox_model: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +141,38 @@ def _load_kokoro() -> Any:
         raise
 
 
+def _resolve_chatterbox_device() -> str:
+    """Resolve device for Chatterbox model."""
+    device = config.tts.chatterbox_device
+    if device == "auto":
+        try:
+            import torch
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            return "cpu"
+    return device
+
+
+def _load_chatterbox() -> Any:
+    """Load the Chatterbox TTS model. Blocking — run in executor."""
+    try:
+        from chatterbox.tts import ChatterboxTTS
+
+        device = _resolve_chatterbox_device()
+        logger.info(
+            "Loading Chatterbox TTS model",
+            extra={"device": device},
+        )
+
+        model = ChatterboxTTS.from_pretrained(device=device)
+
+        logger.info("Chatterbox TTS model loaded successfully")
+        return model
+    except Exception:
+        logger.exception("Failed to load Chatterbox TTS model")
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -146,9 +181,10 @@ def _load_kokoro() -> Any:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     """Load models in background on startup, clean up on shutdown."""
-    global _whisper_model, _kokoro_pipeline
+    global _whisper_model, _kokoro_pipeline, _chatterbox_model
 
     loop = asyncio.get_running_loop()
+    engine = config.tts.engine
 
     # Load STT
     set_model_status("stt", "loading")
@@ -161,22 +197,36 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         set_model_status("stt", "error")
         model_loaded.labels(model_type="stt", model_name=config.stt.model).set(0)
 
-    # Load TTS
-    set_model_status("tts", "loading")
-    try:
-        _kokoro_pipeline = await loop.run_in_executor(None, _load_kokoro)
-        set_model_status("tts", "loaded")
-        model_loaded.labels(model_type="tts", model_name=config.tts.default_model).set(1)
-    except Exception:
-        logger.exception("Failed to load Kokoro TTS pipeline")
-        set_model_status("tts", "error")
-        model_loaded.labels(model_type="tts", model_name=config.tts.default_model).set(0)
+    # Load Kokoro TTS (if configured)
+    if engine in ("kokoro", "both"):
+        set_model_status("tts", "loading")
+        try:
+            _kokoro_pipeline = await loop.run_in_executor(None, _load_kokoro)
+            set_model_status("tts", "loaded")
+            model_loaded.labels(model_type="tts", model_name="kokoro").set(1)
+        except Exception:
+            logger.exception("Failed to load Kokoro TTS pipeline")
+            set_model_status("tts", "error")
+            model_loaded.labels(model_type="tts", model_name="kokoro").set(0)
+
+    # Load Chatterbox TTS (if configured)
+    if engine in ("chatterbox", "both"):
+        set_model_status("tts_chatterbox", "loading")
+        try:
+            _chatterbox_model = await loop.run_in_executor(None, _load_chatterbox)
+            set_model_status("tts_chatterbox", "loaded")
+            model_loaded.labels(model_type="tts", model_name="chatterbox").set(1)
+        except Exception:
+            logger.exception("Failed to load Chatterbox TTS model")
+            set_model_status("tts_chatterbox", "error")
+            model_loaded.labels(model_type="tts", model_name="chatterbox").set(0)
 
     yield
 
     # Cleanup
     _whisper_model = None
     _kokoro_pipeline = None
+    _chatterbox_model = None
     logger.info("Voice service shut down")
 
 
@@ -201,13 +251,25 @@ if config.metrics_enabled:
 
 
 class TTSRequest(BaseModel):
-    """OpenAI-compatible TTS request body."""
+    """OpenAI-compatible TTS request body with Chatterbox extensions."""
 
     input: str = Field(..., min_length=1, max_length=4096, description="Text to synthesize")
     voice: str = Field(default=config.tts.default_voice, description="Voice ID")
     model: str = Field(default=config.tts.default_model, description="TTS model name")
     speed: float = Field(default=1.0, ge=0.25, le=4.0, description="Speech speed multiplier")
     response_format: str = Field(default="mp3", description="Output audio format")
+
+    # Chatterbox-specific fields
+    reference_audio: str | None = Field(
+        default=None,
+        description="Base64-encoded reference audio for voice cloning (Chatterbox only)",
+    )
+    exaggeration: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Emotion exaggeration level 0.0-1.0 (Chatterbox only)",
+    )
 
 
 class TranscriptionResponse(BaseModel):
@@ -339,44 +401,120 @@ async def transcribe(
 
 
 # ---------------------------------------------------------------------------
+# Reference audio helpers
+# ---------------------------------------------------------------------------
+
+
+def _decode_reference_audio(b64_audio: str) -> str:
+    """Decode base64 reference audio to a temp file path.
+
+    Returns the path to a temporary WAV file. Caller must clean up.
+    """
+    audio_bytes = base64.b64decode(b64_audio)
+    if len(audio_bytes) == 0:
+        raise ValueError("Reference audio is empty")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp.write(audio_bytes)
+    tmp.flush()
+    tmp.close()
+    return tmp.name
+
+
+def _chatterbox_synthesize(
+    text: str,
+    reference_audio_path: str | None,
+    exaggeration: float,
+) -> tuple[np.ndarray, int]:
+    """Run Chatterbox synthesis. Blocking — run in executor."""
+    import torch
+
+    kwargs: dict[str, Any] = {"exaggeration": exaggeration}
+    if reference_audio_path is not None:
+        kwargs["audio_prompt"] = reference_audio_path
+
+    wav_tensor = _chatterbox_model.generate(text, **kwargs)
+
+    # Convert torch tensor to numpy float32 array
+    if isinstance(wav_tensor, torch.Tensor):
+        audio_array = wav_tensor.squeeze().cpu().numpy().astype(np.float32)
+    else:
+        audio_array = np.asarray(wav_tensor, dtype=np.float32)
+
+    return audio_array, config.tts.chatterbox_sample_rate
+
+
+# ---------------------------------------------------------------------------
 # TTS endpoint
 # ---------------------------------------------------------------------------
 
 
 @app.post("/v1/audio/speech")
 async def synthesize(request: TTSRequest) -> Response:
-    """Synthesize speech from text (OpenAI-compatible)."""
-    if _kokoro_pipeline is None:
-        raise HTTPException(status_code=503, detail="TTS model is not loaded")
+    """Synthesize speech from text (OpenAI-compatible).
+
+    Routes to Kokoro or Chatterbox based on ``request.model``.
+    Falls back to the configured default engine.
+    """
+    # Determine which engine to use
+    engine = request.model if request.model in ("kokoro", "chatterbox") else config.tts.engine
+    if engine == "both":
+        engine = "kokoro"  # default to kokoro when engine="both"
+
+    if engine == "chatterbox" and _chatterbox_model is None:
+        raise HTTPException(status_code=503, detail="Chatterbox TTS model is not loaded")
+    if engine == "kokoro" and _kokoro_pipeline is None:
+        raise HTTPException(status_code=503, detail="Kokoro TTS model is not loaded")
 
     inference_queue_depth.labels(model_type="tts").inc()
     start_time = time.monotonic()
     voice = request.voice
+    ref_audio_path: str | None = None
 
     try:
         loop = asyncio.get_running_loop()
 
-        # Run Kokoro synthesis in thread pool
-        def _synthesize() -> tuple[np.ndarray, int]:
-            """Generate audio samples from text."""
-            samples_list: list[np.ndarray] = []
-            sample_rate = config.tts.sample_rate
+        if engine == "chatterbox":
+            # Decode reference audio if provided
+            if request.reference_audio:
+                ref_audio_path = await loop.run_in_executor(
+                    None, _decode_reference_audio, request.reference_audio
+                )
 
-            for _gs, _ps, audio in _kokoro_pipeline(
+            exaggeration = (
+                request.exaggeration
+                if request.exaggeration is not None
+                else config.tts.chatterbox_exaggeration
+            )
+
+            audio_array, sample_rate = await loop.run_in_executor(
+                None,
+                _chatterbox_synthesize,
                 request.input,
-                voice=request.voice,
-                speed=request.speed,
-            ):
-                if audio is not None:
-                    samples_list.append(audio)
+                ref_audio_path,
+                exaggeration,
+            )
+        else:
+            # Kokoro synthesis
+            def _synthesize_kokoro() -> tuple[np.ndarray, int]:
+                samples_list: list[np.ndarray] = []
+                sample_rate = config.tts.sample_rate
 
-            if not samples_list:
-                raise ValueError("Kokoro produced no audio output")
+                for _gs, _ps, audio in _kokoro_pipeline(
+                    request.input,
+                    voice=request.voice,
+                    speed=request.speed,
+                ):
+                    if audio is not None:
+                        samples_list.append(audio)
 
-            combined = np.concatenate(samples_list)
-            return combined, sample_rate
+                if not samples_list:
+                    raise ValueError("Kokoro produced no audio output")
 
-        audio_array, sample_rate = await loop.run_in_executor(None, _synthesize)
+                combined = np.concatenate(samples_list)
+                return combined, sample_rate
+
+            audio_array, sample_rate = await loop.run_in_executor(None, _synthesize_kokoro)
 
         # Encode to requested format
         if request.response_format == "wav":
@@ -392,16 +530,18 @@ async def synthesize(request: TTSRequest) -> Response:
         tts_duration_seconds.observe(elapsed)
         tts_characters_total.inc(len(request.input))
         tts_audio_duration_seconds.observe(audio_duration)
-        tts_requests_total.labels(voice=voice, status="success").inc()
+        tts_requests_total.labels(engine=engine, voice=voice, status="success").inc()
 
         logger.info(
             "TTS synthesis complete",
             extra={
+                "engine": engine,
                 "voice": voice,
                 "chars": len(request.input),
                 "duration_s": round(elapsed, 3),
                 "audio_duration_s": round(audio_duration, 3),
                 "format": request.response_format,
+                "voice_cloned": request.reference_audio is not None,
             },
         )
 
@@ -412,12 +552,115 @@ async def synthesize(request: TTSRequest) -> Response:
     except Exception as exc:
         elapsed = time.monotonic() - start_time
         tts_duration_seconds.observe(elapsed)
-        tts_requests_total.labels(voice=voice, status="error").inc()
-        tts_errors_total.labels(error_type=type(exc).__name__).inc()
-        logger.exception("TTS synthesis failed")
+        tts_requests_total.labels(engine=engine, voice=voice, status="error").inc()
+        tts_errors_total.labels(engine=engine, error_type=type(exc).__name__).inc()
+        logger.exception("TTS synthesis failed", extra={"engine": engine})
         raise HTTPException(status_code=500, detail=f"Synthesis failed: {exc}") from exc
     finally:
         inference_queue_depth.labels(model_type="tts").dec()
+        # Clean up temp reference audio file
+        if ref_audio_path is not None:
+            Path(ref_audio_path).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Voice clone preview endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/audio/clone-preview")
+async def clone_preview(
+    reference_audio: UploadFile = File(..., description="Reference audio file for voice cloning"),
+    text: str = Form(
+        default="Hello, this is a preview of my cloned voice.",
+        description="Text to synthesize with the cloned voice",
+        min_length=1,
+        max_length=4096,
+    ),
+    exaggeration: float = Form(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="Emotion exaggeration level",
+    ),
+    response_format: str = Form(default="mp3", description="Output audio format"),
+) -> Response:
+    """Preview a cloned voice using Chatterbox TTS.
+
+    Upload a reference audio file and receive synthesized speech
+    that mimics the reference voice.
+    """
+    if _chatterbox_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Chatterbox TTS model is not loaded. Set TTS_ENGINE=chatterbox or TTS_ENGINE=both.",
+        )
+
+    start_time = time.monotonic()
+    ref_audio_path: str | None = None
+
+    try:
+        # Read uploaded reference audio to temp file
+        content = await reference_audio.read()
+        if len(content) == 0:
+            raise HTTPException(status_code=400, detail="Empty reference audio file")
+
+        suffix = Path(reference_audio.filename or "ref.wav").suffix or ".wav"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(content)
+        tmp.flush()
+        tmp.close()
+        ref_audio_path = tmp.name
+
+        loop = asyncio.get_running_loop()
+        audio_array, sample_rate = await loop.run_in_executor(
+            None,
+            _chatterbox_synthesize,
+            text,
+            ref_audio_path,
+            exaggeration,
+        )
+
+        # Encode to requested format
+        if response_format == "wav":
+            audio_bytes = _encode_wav(audio_array, sample_rate)
+            media_type = "audio/wav"
+        else:
+            audio_bytes = _encode_mp3(audio_array, sample_rate)
+            media_type = "audio/mpeg"
+
+        elapsed = time.monotonic() - start_time
+        audio_duration = len(audio_array) / sample_rate
+
+        tts_duration_seconds.observe(elapsed)
+        tts_audio_duration_seconds.observe(audio_duration)
+        tts_voice_clone_requests_total.labels(status="success").inc()
+
+        logger.info(
+            "Voice clone preview complete",
+            extra={
+                "duration_s": round(elapsed, 3),
+                "audio_duration_s": round(audio_duration, 3),
+                "text_chars": len(text),
+                "exaggeration": exaggeration,
+                "format": response_format,
+            },
+        )
+
+        return Response(content=audio_bytes, media_type=media_type)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        elapsed = time.monotonic() - start_time
+        tts_duration_seconds.observe(elapsed)
+        tts_voice_clone_requests_total.labels(status="error").inc()
+        tts_errors_total.labels(engine="chatterbox", error_type=type(exc).__name__).inc()
+        logger.exception("Voice clone preview failed")
+        raise HTTPException(status_code=500, detail=f"Voice clone failed: {exc}") from exc
+    finally:
+        if ref_audio_path is not None:
+            Path(ref_audio_path).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
