@@ -211,7 +211,6 @@ async def _run_pipeline(
     from pipecat.pipeline.pipeline import Pipeline
     from pipecat.pipeline.runner import PipelineRunner
     from pipecat.pipeline.task import PipelineTask, PipelineParams
-    from pipecat.serializers.protobuf import ProtobufFrameSerializer
     from pipecat.transports.websocket.fastapi import (
         FastAPIWebsocketParams,
         FastAPIWebsocketTransport,
@@ -219,7 +218,7 @@ async def _run_pipeline(
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.audio.vad.vad_analyzer import VADParams
 
-    # 1. Transport — bidirectional audio over WebSocket
+    # 1. Transport — bidirectional audio over WebSocket (raw PCM, no serializer)
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
@@ -235,7 +234,6 @@ async def _run_pipeline(
                     min_volume=config.vad_min_volume,
                 )
             ),
-            serializer=ProtobufFrameSerializer(),
         ),
     )
 
