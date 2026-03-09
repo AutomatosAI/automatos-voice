@@ -10,7 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY services/voice-service/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install numpy first — pkuseg (chatterbox dep) needs it at setup time
+RUN pip install --no-cache-dir numpy && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY services/voice-service/ ./src/
 
