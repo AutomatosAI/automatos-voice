@@ -9,7 +9,7 @@ from typing import AsyncGenerator
 import aiohttp
 
 from pipecat.frames.frames import Frame, TranscriptionFrame, ErrorFrame
-from pipecat.services.ai_services import SegmentedSTTService
+from pipecat.services.stt_service import SegmentedSTTService
 
 logger = logging.getLogger(__name__)
 

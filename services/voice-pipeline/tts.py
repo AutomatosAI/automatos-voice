@@ -9,7 +9,7 @@ from typing import AsyncGenerator
 import aiohttp
 
 from pipecat.frames.frames import Frame, TTSAudioRawFrame, ErrorFrame
-from pipecat.services.ai_services import TTSService
+from pipecat.services.tts_service import TTSService
 
 logger = logging.getLogger(__name__)
 
