@@ -14,6 +14,7 @@ import asyncio
 import base64
 import io
 import logging
+import subprocess
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -26,8 +27,6 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from pythonjsonlogger import jsonlogger
-
 from .config import config
 from .health import router as health_router, set_model_status
 from .metrics import (
@@ -47,19 +46,19 @@ from .metrics import (
 )
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — ship to Loki via log-relay, fall back to local JSON
 # ---------------------------------------------------------------------------
 
-_log_handler = logging.StreamHandler()
-_log_handler.setFormatter(
-    jsonlogger.JsonFormatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
-        rename_fields={"asctime": "timestamp", "levelname": "level", "name": "component"},
+try:
+    from .automatos_logging import setup_logging
+    setup_logging(service="voice-service")
+except Exception:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-)
 
 logger = logging.getLogger("voice-service")
-logger.handlers = [_log_handler]
 logger.setLevel(config.log_level.upper())
 
 # Suppress noisy library loggers
@@ -390,14 +389,47 @@ async def transcribe(
 
         suffix = Path(file.filename or "audio.wav").suffix or ".wav"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        wav_tmp_path: str | None = None
         try:
             tmp.write(content)
             tmp.flush()
             tmp.close()
 
+            # Convert non-wav formats (webm, ogg, mp4, etc.) to wav via ffmpeg
+            # so faster-whisper/PyAV can always decode reliably
+            audio_path = tmp.name
+            if suffix.lower() not in (".wav", ".wave"):
+                wav_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                wav_tmp.close()
+                wav_tmp_path = wav_tmp.name
+                loop = asyncio.get_running_loop()
+                ret = await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        [
+                            "ffmpeg", "-y",
+                            "-i", tmp.name,
+                            "-ar", "16000",
+                            "-ac", "1",
+                            "-f", "wav",
+                            wav_tmp_path,
+                        ],
+                        capture_output=True,
+                        timeout=30,
+                    ),
+                )
+                if ret.returncode != 0:
+                    stderr_msg = (ret.stderr or b"").decode(errors="replace")[:300]
+                    logger.warning(
+                        "ffmpeg conversion failed, falling back to raw file",
+                        extra={"suffix": suffix, "stderr": stderr_msg},
+                    )
+                else:
+                    audio_path = wav_tmp_path
+
             # Get audio duration for metrics
             try:
-                info = sf.info(tmp.name)
+                info = sf.info(audio_path)
                 stt_audio_duration_seconds.observe(info.duration)
             except Exception:
                 pass  # non-critical — don't fail on duration extraction
@@ -407,7 +439,7 @@ async def transcribe(
             segments, info = await loop.run_in_executor(
                 None,
                 lambda: _whisper_model.transcribe(
-                    tmp.name,
+                    audio_path,
                     language=language,
                     beam_size=config.stt.beam_size,
                     vad_filter=config.stt.vad_filter,
@@ -423,6 +455,8 @@ async def transcribe(
 
         finally:
             Path(tmp.name).unlink(missing_ok=True)
+            if wav_tmp_path:
+                Path(wav_tmp_path).unlink(missing_ok=True)
 
         elapsed = time.monotonic() - start_time
         stt_duration_seconds.observe(elapsed)

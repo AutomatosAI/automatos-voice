@@ -24,25 +24,22 @@ from prometheus_client import (
     generate_latest,
     CONTENT_TYPE_LATEST,
 )
-from pythonjsonlogger import jsonlogger
-
 from .config import config
 from .stt import VoiceServiceSTT
 from .tts import VoiceServiceTTS
 from .orchestrator_processor import OrchestratorProcessor
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — ship to Loki via log-relay, fall back to local JSON
 # ---------------------------------------------------------------------------
-handler = logging.StreamHandler()
-handler.setFormatter(
-    jsonlogger.JsonFormatter(
-        "%(asctime)s %(name)s %(levelname)s %(message)s",
-        rename_fields={"asctime": "timestamp", "name": "component"},
+try:
+    from .automatos_logging import setup_logging
+    setup_logging(service="voice-pipeline")
+except Exception:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-)
-logging.root.handlers = [handler]
-logging.root.setLevel(logging.INFO)
 
 for noisy in ("httpx", "httpcore", "websockets"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
