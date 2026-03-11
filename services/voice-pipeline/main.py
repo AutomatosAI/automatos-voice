@@ -28,6 +28,7 @@ from .config import config
 from .stt import VoiceServiceSTT
 from .tts import VoiceServiceTTS
 from .orchestrator_processor import OrchestratorProcessor
+from .raw_pcm_serializer import RawPCMSerializer
 
 # ---------------------------------------------------------------------------
 # Logging — ship to Loki via log-relay, fall back to local JSON
@@ -137,10 +138,8 @@ async def voice_websocket(
     Connect with: ws://host:8301/ws/voice?workspace_id=xxx&token=jwt&agent_id=123
 
     Audio format:
-      - Input:  16-bit PCM, 16kHz, mono (wrapped in protobuf frames)
-      - Output: 16-bit PCM, 24kHz, mono (wrapped in protobuf frames)
-
-    Use @pipecat-ai/client-js with WebSocketTransport on the frontend.
+      - Input:  raw 16-bit PCM, 16kHz, mono (Int16Array from browser)
+      - Output: raw 16-bit PCM, 24kHz, mono (ArrayBuffer to browser)
     """
     # Enforce session limit
     if len(_active_sessions) >= config.max_concurrent_sessions:
@@ -215,13 +214,20 @@ async def _run_pipeline(
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.audio.vad.vad_analyzer import VADParams
 
-    # 1. Transport — bidirectional audio over WebSocket (raw PCM, no serializer)
+    # 1. Transport — bidirectional audio over WebSocket
+    #    Browser sends raw Int16 PCM (16kHz mono) via ArrayBuffer
+    #    Server sends raw Int16 PCM (24kHz mono) back for playback
+    serializer = RawPCMSerializer(
+        sample_rate_in=config.stt_sample_rate,
+        sample_rate_out=config.tts_sample_rate,
+    )
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
+            serializer=serializer,
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
