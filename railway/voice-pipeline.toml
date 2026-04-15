@@ -1,6 +1,6 @@
 [build]
 builder = "DOCKERFILE"
-dockerfilePath = "services/voice-service/Dockerfile"
+dockerfilePath = "services/voice-pipeline/Dockerfile"
 
 [deploy]
 healthcheckPath = "/health"
@@ -10,4 +10,4 @@ restartPolicyMaxRetries = 10
 sleepApplication = false
 
 [service]
-internalPort = 8300
+internalPort = 8301
